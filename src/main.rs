@@ -3,6 +3,7 @@ use goblin::elf::Elf;
 use memmap2::Mmap;
 use std::env;
 use std::fs::File;
+use memchr::memmem;
 
 macro_rules! fail {
     ($($arg:tt)*) => {{
@@ -122,15 +123,25 @@ fn get_elf_sections_to_replace_in_from_ar(
     }
 }
 
-fn replace_bytes(data: &mut [u8], src: &[u8], dst: &[u8]) {
-    let src_len = src.len();
-    let dst_len = dst.len();
+fn replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bool {
+    let len = dst.len();
 
-    for i in 0..data.len() - src_len + 1 {
-        if &data[i..i + src_len] == src {
-            data[i..i + dst_len].copy_from_slice(dst);
+    let mut replaced = false;
+    let mut i : usize = 0;
+    let end = data.len() - len;
+
+    while i <= end {
+        match finder.find(&data[i..]) {
+            Some(pos) => {
+                i += pos;
+                data[i..i + len].copy_from_slice(dst);
+                replaced = true;
+                i += len;
+            }
+            None => { return replaced; }
         }
     }
+    replaced
 }
 
 fn main() {
@@ -140,16 +151,18 @@ fn main() {
     }
 
     let elf_file_path = &args[1];
-    let src_bytes = args[2].as_bytes();
-    let dst_bytes = args[3].as_bytes();
+    let src = &args[2];
+    let dst = &args[3];
+    let src_bytes = src.as_bytes();
+    let dst_bytes = dst.as_bytes();
 
     if src_bytes.len() != dst_bytes.len() {
         fail!(
             "source and destination strings should have the same length in bytes, \
 instead `{}' has {} bytes but `{}' has {} bytes",
-            args[2],
+            src,
             src_bytes.len(),
-            args[3],
+            dst,
             dst_bytes.len()
         );
     }
@@ -159,7 +172,7 @@ instead `{}' has {} bytes but `{}' has {} bytes",
         Err(e) => fail!("Error opening file `{elf_file_path}': {e}"),
     };
 
-    let mmap = unsafe { Mmap::map(&elf_file).unwrap() };
+    let mmap = unsafe { Mmap::map(&elf_file).expect("error mmaping the file") };
     let file_type = detect_mapped_file_type(&mmap);
     let mut sections = Vec::<goblin::elf::SectionHeader>::new();
 
@@ -169,10 +182,14 @@ instead `{}' has {} bytes but `{}' has {} bytes",
         FileType::UNKNOWN => fail!("unknown file type (neither ELF nor ar archive)"),
     };
 
-    let mut mmap_mut = mmap.make_mut().unwrap();
+    let mut mmap_mut = mmap.make_mut().expect("error getting a mutable mmap");
+    let finder = memmem::Finder::new(src_bytes);
     for header in sections {
         let offset = header.sh_offset as usize;
         let size = header.sh_size as usize;
-        replace_bytes(&mut mmap_mut[offset..offset + size], src_bytes, dst_bytes);
+        let replaced = replace_bytes(&mut mmap_mut[offset..offset + size], &finder, &dst_bytes);
+        if replaced {
+            mmap_mut.flush_async_range(offset, size).expect("error flushing file changes");
+        }
     }
 }
