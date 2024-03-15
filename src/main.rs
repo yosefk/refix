@@ -127,7 +127,7 @@ fn replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bool {
     let len = dst.len();
 
     let mut replaced = false;
-    let mut i : usize = 0;
+    let mut i: usize = 0;
     let end = data.len() - len;
 
     while i <= end {
@@ -138,7 +138,9 @@ fn replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bool {
                 replaced = true;
                 i += len;
             }
-            None => { return replaced; }
+            None => {
+                return replaced;
+            }
         }
     }
     replaced
@@ -189,7 +191,9 @@ instead `{}' has {} bytes but `{}' has {} bytes",
         let size = header.sh_size as usize;
         let replaced = replace_bytes(&mut mmap_mut[offset..offset + size], &finder, &dst_bytes);
         if replaced {
-            mmap_mut.flush_async_range(offset, size).expect("error flushing file changes");
+            mmap_mut.flush_async_range(offset, size).expect(
+                "error flushing file changes",
+            );
         }
     }
 }
