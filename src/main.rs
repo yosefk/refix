@@ -1,9 +1,11 @@
-
+use std::cmp::{min, max};
 use goblin::elf::Elf;
 use memmap2::Mmap;
 use std::env;
 use std::fs::File;
 use memchr::memmem;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 
 macro_rules! fail {
     ($($arg:tt)*) => {{
@@ -146,6 +148,24 @@ fn replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bool {
     replaced
 }
 
+fn par_replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bool {
+    let chunk_size = max(dst.len() * 10, 1024 * 1024);
+
+    //process each chunk separately
+    let mut replaced = data.par_chunks_mut(chunk_size)
+        .map(|chunk| replace_bytes(chunk, finder, dst))
+        .reduce(|| false, |acc, x| acc || x);
+
+    //process the overlaps between the chunks
+    for i in (chunk_size..data.len()).step_by(chunk_size) {
+        assert!(i > dst.len());
+        let overlap_start = i - dst.len();
+        let overlap_finish = min(i + dst.len(), data.len());
+        replaced = replace_bytes(&mut data[overlap_start..overlap_finish], finder, dst) || replaced;
+    }
+    replaced
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 4 {
@@ -184,16 +204,21 @@ instead `{}' has {} bytes but `{}' has {} bytes",
         FileType::UNKNOWN => fail!("unknown file type (neither ELF nor ar archive)"),
     };
 
-    let mut mmap_mut = mmap.make_mut().expect("error getting a mutable mmap");
-    let finder = memmem::Finder::new(src_bytes);
-    for header in sections {
-        let offset = header.sh_offset as usize;
-        let size = header.sh_size as usize;
-        let replaced = replace_bytes(&mut mmap_mut[offset..offset + size], &finder, &dst_bytes);
-        if replaced {
-            mmap_mut.flush_async_range(offset, size).expect(
-                "error flushing file changes",
-            );
+    //empirically, more threads doesn't shorten the latency but increases the overall
+    //amount of CPU time spent across all threads
+    let pool = ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+    pool.install(|| {
+        let mut mmap_mut = mmap.make_mut().expect("error getting a mutable mmap");
+        let finder = memmem::Finder::new(src_bytes);
+        for header in sections {
+            let oft = header.sh_offset as usize;
+            let size = header.sh_size as usize;
+            let replaced = par_replace_bytes(&mut mmap_mut[oft..oft + size], &finder, &dst_bytes);
+            if replaced {
+                mmap_mut.flush_async_range(oft, size).expect(
+                    "error flushing file changes",
+                );
+            }
         }
-    }
+    });
 }
