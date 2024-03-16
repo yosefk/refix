@@ -5,15 +5,15 @@ def run(cmd, expect_failure=False):
     print('>>',cmd)
     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     status = proc.wait() 
+    out = proc.stdout.read().decode('utf-8')
+    err = proc.stderr.read().decode('utf-8')
+    result = (out+err).replace('\x00','\n') # for objcopy...
+    sys.stdout.write(result)
     if status and not expect_failure:
         raise Exception(cmd,'FAILED')
     elif status == 0 and expect_failure:
         raise Exception(cmd,'was expected to fail but did not')
-    out = proc.stdout.read().decode('utf-8')
-    err = proc.stderr.read().decode('utf-8')
-    sys.stdout.write(out)
-    sys.stdout.write(err)
-    return out + err
+    return result
 
 def run_and_time(cmd):
     start = time.time()
@@ -55,6 +55,18 @@ def main():
         assert 'our source code' in out
 
         return sed_time, refix_time
+
+    # test --section
+    run('gcc -c test/data.c -o test/out/data.o -g')
+    def get_section(name):
+        return run(f'objcopy --dump-section={name}=/dev/stdout test/out/data.o').strip()
+    assert get_section('.section_to_replace') == 'ORIGDATA'
+    assert get_section('.another_section_to_replace') == 'ORIGDATA'
+    run('echo "NEW DATA" > test/out/data1')
+    run('echo "ANOTHER!" > test/out/data2')
+    run(f'cargo run test/out/data.o {magic} {path} --section .section_to_replace test/out/data1 --section .another_section_to_replace test/out/data2')
+    assert get_section('.section_to_replace') == 'NEW DATA'
+    assert get_section('.another_section_to_replace') == 'ANOTHER!'
 
     # test support for the ar format
     run('gcc -c test/small.c -o test/out/small.o')

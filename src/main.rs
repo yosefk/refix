@@ -3,9 +3,11 @@ use goblin::elf::Elf;
 use memmap2::Mmap;
 use std::env;
 use std::fs::File;
+use std::io::{Read, BufReader};
 use memchr::memmem;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use std::collections::HashMap;
 
 macro_rules! fail {
     ($($arg:tt)*) => {{
@@ -41,20 +43,33 @@ fn detect_mapped_file_type(data: &[u8]) -> FileType {
 //
 //goblin gives us the ELF section headers which have file offsets [byte offsets
 //for mmaped files] in the sh_offset field, so we needn't copy data but can work in-place easily
-fn get_elf_sections_to_replace_in(data: &[u8], sections: &mut Vec<goblin::elf::SectionHeader>, offset: u64) {
+fn get_elf_sections_to_replace_in<'a>(
+    data: &[u8],
+    sections: &mut Vec<goblin::elf::SectionHeader>,
+    sections_to_fully_replace: &'a HashMap<String, Vec<u8>>,
+    fully_replaced: &mut Vec<(goblin::elf::SectionHeader, &'a [u8])>,
+    offset: u64,
+) {
     let prefix_list = vec![".rodata", ".debug_line", ".debug_str"];
 
     match Elf::parse(data) {
         Ok(elf) => {
             for header in elf.section_headers.iter() {
+                let mut h = header.clone();
+                h.sh_offset += offset;
+
                 let name = elf.shdr_strtab.get_at(header.sh_name).unwrap_or(
                     "<invalid utf-8>",
                 );
                 let name_matches = prefix_list.iter().any(|prefix| name.starts_with(prefix));
                 if name_matches {
-                    let mut h = header.clone();
-                    h.sh_offset += offset;
-                    sections.push(h);
+                    sections.push(h.clone());
+                }
+                if let Some(data) = sections_to_fully_replace.get(name) {
+                    if data.len() != h.sh_size as usize {
+                        fail!("section {name} has the size {} - cannot replace with {} bytes", h.sh_size, data.len());
+                    }
+                    fully_replaced.push((h.clone(), data));
                 }
             }
         }
@@ -76,7 +91,12 @@ fn get_elf_sections_to_replace_in(data: &[u8], sections: &mut Vec<goblin::elf::S
 //    char ar_fmag[2];		/* Always contains ARFMAG.  */
 //  };
 //
-fn get_elf_sections_to_replace_in_from_ar(data: &[u8], sections: &mut Vec<goblin::elf::SectionHeader>) {
+fn get_elf_sections_to_replace_in_from_ar<'a>(
+    data: &[u8],
+    sections: &mut Vec<goblin::elf::SectionHeader>,
+    sections_to_fully_replace: &'a HashMap<String, Vec<u8>>,
+    fully_replaced: &mut Vec<(goblin::elf::SectionHeader, &'a [u8])>,
+) {
     let ar_hdr_size = 60;
     let ar_size_offset = 48;
     let ar_size_len = 10;
@@ -107,7 +127,7 @@ fn get_elf_sections_to_replace_in_from_ar(data: &[u8], sections: &mut Vec<goblin
             "archive has a file with an end offset past the archive size",
         );
         match detect_mapped_file_type(file_data) {
-            FileType::ELF => get_elf_sections_to_replace_in(&file_data, sections, pos as u64),
+            FileType::ELF => get_elf_sections_to_replace_in(&file_data, sections, sections_to_fully_replace, fully_replaced, pos as u64),
             _ => (),
         }
 
@@ -163,9 +183,9 @@ fn par_replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8], min_c
     replaced
 }
 
-fn parse_args() -> (String, Vec<u8>, Vec<u8>) {
+fn parse_args(sections_to_fully_replace: &mut HashMap<String, Vec<u8>>) -> (String, Vec<u8>, Vec<u8>) {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 4 {
+    if args.len() < 4 {
         fail!("Usage: {} <elf_file> <src> <dst>", args[0]);
     }
 
@@ -185,11 +205,49 @@ fn parse_args() -> (String, Vec<u8>, Vec<u8>) {
         );
     }
 
+    let mut iter = args.iter().skip(4).peekable();
+
+    while let Some(arg) = iter.next() {
+        if arg == "--section" {
+            let section = match iter.next() {
+                Some(val) => val,
+                None => {
+                    fail!("missing section name after --section");
+                }
+            };
+            match iter.next() {
+                Some(filename) => {
+                    let file = match File::open(&filename) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            fail!("failed to open {filename}: {e}");
+                        }
+                    };
+                    let mut reader = BufReader::new(file);
+
+                    // Read the file contents into a buffer
+                    let mut buffer = Vec::<u8>::new();
+                    reader.read_to_end(&mut buffer).expect(
+                        "error reading from section data file",
+                    );
+
+                    sections_to_fully_replace.insert(section.clone(), buffer);
+                }
+                None => {
+                    fail!("missing data filename after --section");
+                }
+            };
+        } else {
+            fail!("unexpected argument {arg}");
+        }
+    }
+
     (elf_file_path.to_string(), src_bytes.to_vec(), dst_bytes.to_vec())
 }
 
 fn main() {
-    let (elf_file_path, src_bytes, dst_bytes) = parse_args();
+    let mut sections_to_fully_replace = HashMap::<String, Vec<u8>>::new();
+    let (elf_file_path, src_bytes, dst_bytes) = parse_args(&mut sections_to_fully_replace);
 
     let elf_file = match File::options().read(true).write(true).open(
         elf_file_path.clone(),
@@ -201,10 +259,11 @@ fn main() {
     let mmap = unsafe { Mmap::map(&elf_file).expect("error mmaping the file") };
     let file_type = detect_mapped_file_type(&mmap);
     let mut sections = Vec::<goblin::elf::SectionHeader>::new();
+    let mut fully_replaced = Vec::<(goblin::elf::SectionHeader, &[u8])>::new();
 
     match file_type {
-        FileType::ELF => get_elf_sections_to_replace_in(&mmap, &mut sections, 0),
-        FileType::AR => get_elf_sections_to_replace_in_from_ar(&mmap, &mut sections),
+        FileType::ELF => get_elf_sections_to_replace_in(&mmap, &mut sections, &sections_to_fully_replace, &mut fully_replaced, 0),
+        FileType::AR => get_elf_sections_to_replace_in_from_ar(&mmap, &mut sections, &sections_to_fully_replace, &mut fully_replaced),
         FileType::UNKNOWN => fail!("unknown file type (neither ELF nor ar archive)"),
     };
 
@@ -225,6 +284,15 @@ fn main() {
             );
         }
     });
+
+    for (header, new_data) in fully_replaced {
+        let offset = header.sh_offset as usize;
+        let size = header.sh_size as usize;
+        mmap_mut[offset..offset + size].copy_from_slice(new_data);
+        mmap_mut.flush_async_range(offset, size).expect(
+            "error flushing file changes",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -245,9 +313,11 @@ mod tests {
         let data_size = 1024;
 
         for num_srcs in 1..3 {
-            (32..40).into_par_iter().for_each(|chunk_size| {
-                for first_src_pos in 0..chunk_size * 2 + 1 {
-                    for second_src_pos in first_src_pos+1..first_src_pos+src.len()+chunk_size+1 {
+            (32..40).into_par_iter().for_each(
+                |chunk_size| for first_src_pos in
+                    0..chunk_size * 2 + 1
+                {
+                    for second_src_pos in first_src_pos + 1..first_src_pos + src.len() + chunk_size + 1 {
                         let mut data = vec![0; data_size];
                         let mut expected = vec![0; data_size];
                         println!("chunk size {chunk_size} num_srcs {num_srcs} first pos {first_src_pos} second pos {second_src_pos}");
@@ -256,10 +326,9 @@ mod tests {
                             let fpos = first_src_pos + offset;
                             let spos = second_src_pos + offset;
                             data[fpos..fpos + src.len()].copy_from_slice(src);
-                            if num_srcs == 1 || spos >= fpos+src.len() {
+                            if num_srcs == 1 || spos >= fpos + src.len() {
                                 expected[fpos..fpos + dst.len()].copy_from_slice(dst);
-                            }
-                            else {
+                            } else {
                                 expected[fpos..fpos + dst.len()].copy_from_slice(src);
                             }
 
@@ -275,8 +344,8 @@ mod tests {
 
                         assert_eq!(data, expected);
                     }
-                }
-            });
+                },
+            );
         }
     }
 }
