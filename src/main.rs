@@ -233,6 +233,9 @@ mod tests {
 
     #[test]
     fn test_par_replace_bytes() {
+        //note that we use strings of length 3 and the test chunk size is 32 or larger and 3*30 < 32,
+        //significantly since par_replace_bytes does:
+        //  let chunk_size = max(dst.len() * 10, min_chunk_size);
         let src = b"ABC";
         let dst = b"XYZ";
         assert!(src.len() == dst.len());
@@ -242,32 +245,38 @@ mod tests {
         let data_size = 1024;
 
         for num_srcs in 1..3 {
-            for chunk_size in 32..34 {
+            (32..40).into_par_iter().for_each(|chunk_size| {
                 for first_src_pos in 0..chunk_size * 2 + 1 {
                     for second_src_pos in first_src_pos+1..first_src_pos+src.len()+chunk_size+1 {
                         let mut data = vec![0; data_size];
                         let mut expected = vec![0; data_size];
                         println!("chunk size {chunk_size} num_srcs {num_srcs} first pos {first_src_pos} second pos {second_src_pos}");
 
-                        data[first_src_pos..first_src_pos + src.len()].copy_from_slice(src);
-                        if num_srcs == 1 || second_src_pos >= first_src_pos+src.len() {
-                            expected[first_src_pos..first_src_pos + dst.len()].copy_from_slice(dst);
-                        }
-                        else {
-                            expected[first_src_pos..first_src_pos + dst.len()].copy_from_slice(src);
-                        }
+                        let mut fill = |offset: usize| {
+                            let fpos = first_src_pos + offset;
+                            let spos = second_src_pos + offset;
+                            data[fpos..fpos + src.len()].copy_from_slice(src);
+                            if num_srcs == 1 || spos >= fpos+src.len() {
+                                expected[fpos..fpos + dst.len()].copy_from_slice(dst);
+                            }
+                            else {
+                                expected[fpos..fpos + dst.len()].copy_from_slice(src);
+                            }
 
-                        if num_srcs == 2 {
-                            data[second_src_pos..second_src_pos + src.len()].copy_from_slice(src);
-                            expected[second_src_pos..second_src_pos + dst.len()].copy_from_slice(dst);
-                        }
+                            if num_srcs == 2 {
+                                data[spos..spos + src.len()].copy_from_slice(src);
+                                expected[spos..spos + dst.len()].copy_from_slice(dst);
+                            }
+                        };
+                        fill(0);
+                        fill(data_size - (second_src_pos + src.len()));
 
                         par_replace_bytes(&mut data, &finder, &dst[..], chunk_size);
 
                         assert_eq!(data, expected);
                     }
                 }
-            }
+            });
         }
     }
 }
