@@ -45,31 +45,30 @@ fn detect_mapped_file_type(data: &[u8]) -> FileType {
 //for mmaped files] in the sh_offset field, so we needn't copy data but can work in-place easily
 fn get_elf_sections_to_replace_in<'a>(
     data: &[u8],
-    sections: &mut Vec<goblin::elf::SectionHeader>,
+    sections: &mut Vec<(usize,usize)>,
     sections_to_fully_replace: &'a HashMap<String, Vec<u8>>,
-    fully_replaced: &mut Vec<(goblin::elf::SectionHeader, &'a [u8])>,
-    offset: u64,
+    fully_replaced: &mut Vec<(usize,&'a [u8])>,
+    offset: usize,
 ) {
     let prefix_list = vec![".rodata", ".debug_line", ".debug_str"];
 
     match Elf::parse(data) {
         Ok(elf) => {
             for header in elf.section_headers.iter() {
-                let mut h = header.clone();
-                h.sh_offset += offset;
+                let oft = header.sh_offset as usize + offset;
 
                 let name = elf.shdr_strtab.get_at(header.sh_name).unwrap_or(
                     "<invalid utf-8>",
                 );
                 let name_matches = prefix_list.iter().any(|prefix| name.starts_with(prefix));
                 if name_matches {
-                    sections.push(h.clone());
+                    sections.push((oft, header.sh_size as usize));
                 }
                 if let Some(data) = sections_to_fully_replace.get(name) {
-                    if data.len() != h.sh_size as usize {
-                        fail!("section {name} has the size {} - cannot replace with {} bytes", h.sh_size, data.len());
+                    if data.len() != header.sh_size as usize {
+                        fail!("section {name} has the size {} - cannot replace with {} bytes", header.sh_size, data.len());
                     }
-                    fully_replaced.push((h.clone(), data));
+                    fully_replaced.push((oft, data));
                 }
             }
         }
@@ -93,9 +92,9 @@ fn get_elf_sections_to_replace_in<'a>(
 //
 fn get_elf_sections_to_replace_in_from_ar<'a>(
     data: &[u8],
-    sections: &mut Vec<goblin::elf::SectionHeader>,
+    sections: &mut Vec<(usize,usize)>,
     sections_to_fully_replace: &'a HashMap<String, Vec<u8>>,
-    fully_replaced: &mut Vec<(goblin::elf::SectionHeader, &'a [u8])>,
+    fully_replaced: &mut Vec<(usize, &'a [u8])>,
 ) {
     let ar_hdr_size = 60;
     let ar_size_offset = 48;
@@ -127,7 +126,7 @@ fn get_elf_sections_to_replace_in_from_ar<'a>(
             "archive has a file with an end offset past the archive size",
         );
         match detect_mapped_file_type(file_data) {
-            FileType::ELF => get_elf_sections_to_replace_in(&file_data, sections, sections_to_fully_replace, fully_replaced, pos as u64),
+            FileType::ELF => get_elf_sections_to_replace_in(&file_data, sections, sections_to_fully_replace, fully_replaced, pos),
             _ => (),
         }
 
@@ -258,13 +257,18 @@ fn main() {
 
     let mmap = unsafe { Mmap::map(&elf_file).expect("error mmaping the file") };
     let file_type = detect_mapped_file_type(&mmap);
-    let mut sections = Vec::<goblin::elf::SectionHeader>::new();
-    let mut fully_replaced = Vec::<(goblin::elf::SectionHeader, &[u8])>::new();
+    let mut sections = Vec::<(usize,usize)>::new();
+    let mut fully_replaced = Vec::<(usize, &[u8])>::new();
 
     match file_type {
         FileType::ELF => get_elf_sections_to_replace_in(&mmap, &mut sections, &sections_to_fully_replace, &mut fully_replaced, 0),
         FileType::AR => get_elf_sections_to_replace_in_from_ar(&mmap, &mut sections, &sections_to_fully_replace, &mut fully_replaced),
-        FileType::UNKNOWN => fail!("unknown file type (neither ELF nor ar archive)"),
+        FileType::UNKNOWN => {
+            if sections_to_fully_replace.len() > 0 {
+                fail!("unknown file type (neither ELF nor ar archive) - can't find sections within it");
+            }
+            sections.push((0, mmap.len()));
+        }
     };
 
     let mut mmap_mut = mmap.make_mut().expect("error getting a mutable mmap");
@@ -273,9 +277,7 @@ fn main() {
     //empirically, more threads doesn't shorten the latency but increases the overall
     //amount of CPU time spent across all threads
     let pool = ThreadPoolBuilder::new().num_threads(8).build().unwrap();
-    pool.install(|| for header in sections {
-        let offset = header.sh_offset as usize;
-        let size = header.sh_size as usize;
+    pool.install(|| for (offset, size) in sections {
         let chunk = 1024 * 1024;
         let replaced = par_replace_bytes(&mut mmap_mut[offset..offset + size], &finder, &dst_bytes, chunk);
         if replaced {
@@ -285,11 +287,9 @@ fn main() {
         }
     });
 
-    for (header, new_data) in fully_replaced {
-        let offset = header.sh_offset as usize;
-        let size = header.sh_size as usize;
-        mmap_mut[offset..offset + size].copy_from_slice(new_data);
-        mmap_mut.flush_async_range(offset, size).expect(
+    for (offset, new_data) in fully_replaced {
+        mmap_mut[offset..offset + new_data.len()].copy_from_slice(new_data);
+        mmap_mut.flush_async_range(offset, new_data.len()).expect(
             "error flushing file changes",
         );
     }

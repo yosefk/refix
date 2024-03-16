@@ -56,6 +56,13 @@ def main():
 
         return sed_time, refix_time
 
+    # a ~3GB file with ~10% data to replace
+    run("dd if=/dev/zero bs=1M count=3072 | tr '\\0' 'A' > test/out/As")
+    run("dd if=/dev/zero bs=1M count=307 | tr '\\0' 'B' >> test/out/As")
+    t = run_and_time("cargo run test/out/As "+'B'*100+" "+'C'*100)
+    print('a 3GB file processed fully, without skipping sections took',t,'seconds')
+    run('rm test/out/As')
+
     # test --section
     run('gcc -c test/data.c -o test/out/data.o -g')
     def get_section(name):
