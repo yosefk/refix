@@ -1,0 +1,12 @@
+max_width = 150
+fn_call_width=150
+attr_fn_like_width=150
+struct_lit_width=150
+struct_variant_width=150
+array_width=150
+chain_width=150
+single_line_if_else_max_width=150
+single_line_let_else_max_width=150
+use_small_heuristics = "Max"
+fn_params_layout = "Compressed"
+fn_call_style = "Block"

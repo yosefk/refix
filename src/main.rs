@@ -41,11 +41,7 @@ fn detect_mapped_file_type(data: &[u8]) -> FileType {
 //
 //goblin gives us the ELF section headers which have file offsets [byte offsets
 //for mmaped files] in the sh_offset field, so we needn't copy data but can work in-place easily
-fn get_elf_sections_to_replace_in(
-    data: &[u8],
-    sections: &mut Vec<goblin::elf::SectionHeader>,
-    offset: u64,
-) {
+fn get_elf_sections_to_replace_in(data: &[u8], sections: &mut Vec<goblin::elf::SectionHeader>, offset: u64) {
     let prefix_list = vec![".rodata", ".debug_line", ".debug_str"];
 
     match Elf::parse(data) {
@@ -80,20 +76,16 @@ fn get_elf_sections_to_replace_in(
 //    char ar_fmag[2];		/* Always contains ARFMAG.  */
 //  };
 //
-fn get_elf_sections_to_replace_in_from_ar(
-    data: &[u8],
-    sections: &mut Vec<goblin::elf::SectionHeader>,
-) {
+fn get_elf_sections_to_replace_in_from_ar(data: &[u8], sections: &mut Vec<goblin::elf::SectionHeader>) {
     let ar_hdr_size = 60;
     let ar_size_offset = 48;
     let ar_size_len = 10;
 
     let mut pos = ARMAG.len();
     while pos < data.len() {
-        if pos + ar_hdr_size > data.len() {
-            fail!("archive truncated within an ar_hdr struct");
-        }
-        let hdr = &data[pos..pos + ar_hdr_size];
+        let hdr = &data.get(pos..pos + ar_hdr_size).expect(
+            "archive truncated within an ar_hdr struct",
+        );
         if !hdr.ends_with(ARFMAG) {
             fail!("archive has a corrupted ar_hdr - ARFMAG not found");
         }
@@ -111,11 +103,9 @@ fn get_elf_sections_to_replace_in_from_ar(
 
         pos += ar_hdr_size;
 
-        if pos + int_size > data.len() {
-            fail!("archive has a file with an end offset past the archive size");
-        }
-
-        let file_data = &data[pos..pos + int_size];
+        let file_data = &data.get(pos..pos + int_size).expect(
+            "archive has a file with an end offset past the archive size",
+        );
         match detect_mapped_file_type(file_data) {
             FileType::ELF => get_elf_sections_to_replace_in(&file_data, sections, pos as u64),
             _ => (),
@@ -127,6 +117,9 @@ fn get_elf_sections_to_replace_in_from_ar(
 
 fn replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bool {
     let len = dst.len();
+    if data.len() < len {
+        return false;
+    }
 
     let mut replaced = false;
     let mut i: usize = 0;
@@ -148,8 +141,12 @@ fn replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bool {
     replaced
 }
 
-fn par_replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bool {
-    let chunk_size = max(dst.len() * 10, 1024 * 1024);
+//note that we don't worry about cases like replacing the string AAA with BBB, and what happens
+//if the input has the substring AAAAA [where if you run sequentially you should get BBBAA,
+//but if you run in parallel the way we do it and AAAAA is split between two chunks,
+//you might get ABBBA or AABBB], because these cases are irrelevant in the context of this program
+fn par_replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8], min_chunk_size: usize) -> bool {
+    let chunk_size = max(dst.len() * 10, min_chunk_size);
 
     //process each chunk separately
     let mut replaced = data.par_chunks_mut(chunk_size)
@@ -166,7 +163,7 @@ fn par_replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bo
     replaced
 }
 
-fn main() {
+fn parse_args() -> (String, Vec<u8>, Vec<u8>) {
     let args: Vec<String> = env::args().collect();
     if args.len() != 4 {
         fail!("Usage: {} <elf_file> <src> <dst>", args[0]);
@@ -180,8 +177,7 @@ fn main() {
 
     if src_bytes.len() != dst_bytes.len() {
         fail!(
-            "source and destination strings should have the same length in bytes, \
-instead `{}' has {} bytes but `{}' has {} bytes",
+            "source and destination strings should have the same length in bytes, instead `{}' has {} bytes but `{}' has {} bytes",
             src,
             src_bytes.len(),
             dst,
@@ -189,7 +185,15 @@ instead `{}' has {} bytes but `{}' has {} bytes",
         );
     }
 
-    let elf_file = match File::options().read(true).write(true).open(elf_file_path) {
+    (elf_file_path.to_string(), src_bytes.to_vec(), dst_bytes.to_vec())
+}
+
+fn main() {
+    let (elf_file_path, src_bytes, dst_bytes) = parse_args();
+
+    let elf_file = match File::options().read(true).write(true).open(
+        elf_file_path.clone(),
+    ) {
         Ok(f) => f,
         Err(e) => fail!("Error opening file `{elf_file_path}': {e}"),
     };
@@ -204,21 +208,66 @@ instead `{}' has {} bytes but `{}' has {} bytes",
         FileType::UNKNOWN => fail!("unknown file type (neither ELF nor ar archive)"),
     };
 
+    let mut mmap_mut = mmap.make_mut().expect("error getting a mutable mmap");
+    let finder = memmem::Finder::new(&src_bytes[..]);
+
     //empirically, more threads doesn't shorten the latency but increases the overall
     //amount of CPU time spent across all threads
     let pool = ThreadPoolBuilder::new().num_threads(8).build().unwrap();
-    pool.install(|| {
-        let mut mmap_mut = mmap.make_mut().expect("error getting a mutable mmap");
-        let finder = memmem::Finder::new(src_bytes);
-        for header in sections {
-            let oft = header.sh_offset as usize;
-            let size = header.sh_size as usize;
-            let replaced = par_replace_bytes(&mut mmap_mut[oft..oft + size], &finder, &dst_bytes);
-            if replaced {
-                mmap_mut.flush_async_range(oft, size).expect(
-                    "error flushing file changes",
-                );
-            }
+    pool.install(|| for header in sections {
+        let offset = header.sh_offset as usize;
+        let size = header.sh_size as usize;
+        let chunk = 1024 * 1024;
+        let replaced = par_replace_bytes(&mut mmap_mut[offset..offset + size], &finder, &dst_bytes, chunk);
+        if replaced {
+            mmap_mut.flush_async_range(offset, size).expect(
+                "error flushing file changes",
+            );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_par_replace_bytes() {
+        let src = b"ABC";
+        let dst = b"XYZ";
+        assert!(src.len() == dst.len());
+
+        let finder = memmem::Finder::new(&src);
+
+        let data_size = 1024;
+
+        for num_srcs in 1..3 {
+            for chunk_size in 32..34 {
+                for first_src_pos in 0..chunk_size * 2 + 1 {
+                    for second_src_pos in first_src_pos+1..first_src_pos+src.len()+chunk_size+1 {
+                        let mut data = vec![0; data_size];
+                        let mut expected = vec![0; data_size];
+                        println!("chunk size {chunk_size} num_srcs {num_srcs} first pos {first_src_pos} second pos {second_src_pos}");
+
+                        data[first_src_pos..first_src_pos + src.len()].copy_from_slice(src);
+                        if num_srcs == 1 || second_src_pos >= first_src_pos+src.len() {
+                            expected[first_src_pos..first_src_pos + dst.len()].copy_from_slice(dst);
+                        }
+                        else {
+                            expected[first_src_pos..first_src_pos + dst.len()].copy_from_slice(src);
+                        }
+
+                        if num_srcs == 2 {
+                            data[second_src_pos..second_src_pos + src.len()].copy_from_slice(src);
+                            expected[second_src_pos..second_src_pos + dst.len()].copy_from_slice(dst);
+                        }
+
+                        par_replace_bytes(&mut data, &finder, &dst[..], chunk_size);
+
+                        assert_eq!(data, expected);
+                    }
+                }
+            }
+        }
+    }
 }
