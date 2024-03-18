@@ -95,7 +95,8 @@ fn get_elf_sections_to_replace_in_from_ar<'a>(
     sections: &mut Vec<(usize,usize)>,
     sections_to_fully_replace: &'a HashMap<String, Vec<u8>>,
     fully_replaced: &mut Vec<(usize, &'a [u8])>,
-) {
+) -> i32 {
+    let mut num_elfs = 0;
     let ar_hdr_size = 60;
     let ar_size_offset = 48;
     let ar_size_len = 10;
@@ -126,12 +127,16 @@ fn get_elf_sections_to_replace_in_from_ar<'a>(
             "archive has a file with an end offset past the archive size",
         );
         match detect_mapped_file_type(file_data) {
-            FileType::ELF => get_elf_sections_to_replace_in(&file_data, sections, sections_to_fully_replace, fully_replaced, pos),
+            FileType::ELF => {
+                get_elf_sections_to_replace_in(&file_data, sections, sections_to_fully_replace, fully_replaced, pos);
+                num_elfs += 1;
+            },
             _ => (),
         }
 
         pos += int_size;
     }
+    num_elfs
 }
 
 fn replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8]) -> bool {
@@ -262,7 +267,17 @@ fn main() {
 
     match file_type {
         FileType::ELF => get_elf_sections_to_replace_in(&mmap, &mut sections, &sections_to_fully_replace, &mut fully_replaced, 0),
-        FileType::AR => get_elf_sections_to_replace_in_from_ar(&mmap, &mut sections, &sections_to_fully_replace, &mut fully_replaced),
+        FileType::AR => {
+            let num_elfs = get_elf_sections_to_replace_in_from_ar(&mmap, &mut sections, &sections_to_fully_replace, &mut fully_replaced);
+            if num_elfs == 0 { //if this is an ar archive with object files in a format other than ELF,
+                //treat it as "generic data" (rather than silently doing nothing and reporting success
+                //due to not finding the relevant sections in it...)
+                if sections_to_fully_replace.len() > 0 {
+                    fail!("an ar archive without ELF object files - can't find sections within it");
+                }
+                sections.push((0, mmap.len()));
+            }
+        }
         FileType::UNKNOWN => {
             if sections_to_fully_replace.len() > 0 {
                 fail!("unknown file type (neither ELF nor ar archive) - can't find sections within it");

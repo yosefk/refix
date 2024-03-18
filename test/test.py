@@ -32,7 +32,8 @@ def main():
 
     def sed_and_refix(what):
         path_for_sed = path.replace('/','\\/')
-        sed_time = run_and_time(f'sed "s/{magic}/{path_for_sed}/g" test/out/{what} > test/out/{what}.ref')
+        run(f'cp test/out/{what} test/out/{what}.ref')
+        sed_time = run_and_time(f'sed -i "s/{magic}/{path_for_sed}/g" test/out/{what}.ref')
         refix_time = run_and_time(f'cargo run --release test/out/{what} {magic} {path}')
         run(f'diff --brief test/out/{what} test/out/{what}.ref')
         return sed_time, refix_time
