@@ -1,5 +1,6 @@
 use std::cmp::{min, max};
-use goblin::elf::Elf;
+use goblin::elf::{Elf, section_header, SectionHeader};
+use goblin::strtab::Strtab;
 use memmap2::Mmap;
 use std::env;
 use std::fs::File;
@@ -37,6 +38,45 @@ fn detect_mapped_file_type(data: &[u8]) -> FileType {
     }
 }
 
+//we don't use Elf::parse because it can take ~300ms on a 3GB ELF with a lot of symbols
+//and this is longer than it'd take to process the entire ELF file as a flat memory region
+//with no parsing a-la sed. instead we parse only the parts we need - section headers
+//and the section string table
+//
+//the code is taken from Elf::parse, with the stuff we needn't parse omitted
+fn parse_elf(bytes: &[u8]) -> goblin::error::Result<Elf> {
+    let header = Elf::parse_header(bytes)?;
+    let mut elf = Elf::lazy_parse(header)?;
+
+    //elf.ctx is private so we recreate it here
+    let container = if elf.is_64 { goblin::container::Container::Big } else { goblin::container::Container::Little };
+    let endianness = scroll::Endian::from(elf.little_endian);
+    let ctx = goblin::container::Ctx::new(container, endianness);
+
+    elf.section_headers = SectionHeader::parse(bytes, header.e_shoff as usize, header.e_shnum as usize, ctx)?;
+
+    let get_strtab = |section_headers: &[SectionHeader], mut section_idx: usize| {
+        if section_idx == section_header::SHN_XINDEX as usize {
+            if section_headers.is_empty() {
+                return Ok(Strtab::default());
+            }
+            section_idx = section_headers[0].sh_link as usize;
+        }
+
+        if section_idx >= section_headers.len() {
+            fail!("section names string table index out of bounds");
+        } else {
+            let shdr = &section_headers[section_idx];
+            shdr.check_size(bytes.len())?;
+            Strtab::parse(bytes, shdr.sh_offset as usize, shdr.sh_size as usize, 0x0)
+        }
+    };
+
+    let strtab_idx = header.e_shstrndx as usize;
+    elf.shdr_strtab = get_strtab(&elf.section_headers, strtab_idx)?;
+    Ok(elf)
+}
+
 //in ELF files, we look for sections with string constants (.rodata or .rodata.*)
 //where __FILE__ goes, or DWARF sections where file paths go (.debug_line and .debug_str),
 //and copy their headers (to use the offset and size later).
@@ -45,14 +85,14 @@ fn detect_mapped_file_type(data: &[u8]) -> FileType {
 //for mmaped files] in the sh_offset field, so we needn't copy data but can work in-place easily
 fn get_elf_sections_to_replace_in<'a>(
     data: &[u8],
-    sections: &mut Vec<(usize,usize)>,
+    sections: &mut Vec<(usize, usize)>,
     sections_to_fully_replace: &'a HashMap<String, Vec<u8>>,
-    fully_replaced: &mut Vec<(usize,&'a [u8])>,
+    fully_replaced: &mut Vec<(usize, &'a [u8])>,
     offset: usize,
 ) {
     let prefix_list = vec![".rodata", ".debug_line", ".debug_str"];
 
-    match Elf::parse(data) {
+    match parse_elf(data) {
         Ok(elf) => {
             for header in elf.section_headers.iter() {
                 let oft = header.sh_offset as usize + offset;
@@ -92,7 +132,7 @@ fn get_elf_sections_to_replace_in<'a>(
 //
 fn get_elf_sections_to_replace_in_from_ar<'a>(
     data: &[u8],
-    sections: &mut Vec<(usize,usize)>,
+    sections: &mut Vec<(usize, usize)>,
     sections_to_fully_replace: &'a HashMap<String, Vec<u8>>,
     fully_replaced: &mut Vec<(usize, &'a [u8])>,
 ) -> i32 {
@@ -130,7 +170,7 @@ fn get_elf_sections_to_replace_in_from_ar<'a>(
             FileType::ELF => {
                 get_elf_sections_to_replace_in(&file_data, sections, sections_to_fully_replace, fully_replaced, pos);
                 num_elfs += 1;
-            },
+            }
             _ => (),
         }
 
@@ -262,14 +302,15 @@ fn main() {
 
     let mmap = unsafe { Mmap::map(&elf_file).expect("error mmaping the file") };
     let file_type = detect_mapped_file_type(&mmap);
-    let mut sections = Vec::<(usize,usize)>::new();
+    let mut sections = Vec::<(usize, usize)>::new();
     let mut fully_replaced = Vec::<(usize, &[u8])>::new();
 
     match file_type {
         FileType::ELF => get_elf_sections_to_replace_in(&mmap, &mut sections, &sections_to_fully_replace, &mut fully_replaced, 0),
         FileType::AR => {
             let num_elfs = get_elf_sections_to_replace_in_from_ar(&mmap, &mut sections, &sections_to_fully_replace, &mut fully_replaced);
-            if num_elfs == 0 { //if this is an ar archive with object files in a format other than ELF,
+            if num_elfs == 0 {
+                //if this is an ar archive with object files in a format other than ELF,
                 //treat it as "generic data" (rather than silently doing nothing and reporting success
                 //due to not finding the relevant sections in it...)
                 if sections_to_fully_replace.len() > 0 {
