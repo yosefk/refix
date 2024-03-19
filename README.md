@@ -70,5 +70,5 @@ You could do this with `objcopy`, same as you could replace the prefixes with `s
 is doing it faster (by optimizing for the "same-sized old & new string length" case, as well as knowing
 to ignore most of the input file where nothing ever needs to be changed.)
 
-  
-[1]: dfd
+Of course, you needn't have this "version info section" to use refix for putting the source path
+into your binaries. It's another, separate thing you can do that helps with debugging.
