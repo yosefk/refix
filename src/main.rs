@@ -230,7 +230,7 @@ fn par_replace_bytes(data: &mut [u8], finder: &memmem::Finder, dst: &[u8], min_c
 fn parse_args(sections_to_fully_replace: &mut HashMap<String, Vec<u8>>) -> (String, Vec<u8>, Vec<u8>) {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        fail!("Usage: {} <elf_file> <src> <dst>", args[0]);
+        fail!("Usage: {} <elf_file> <old-source-prefix> <new-source-prefix> [--section name file --section ...]", args[0]);
     }
 
     let elf_file_path = &args[1];
